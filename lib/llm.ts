@@ -1,9 +1,11 @@
 import OpenAI from 'openai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const LLM_PROVIDER = process.env.LLM_PROVIDER || 'openai';
 
 // Lazy initialization to avoid build-time failures
 let _openai: OpenAI | null = null;
+let _gemini: GoogleGenerativeAI | null = null;
 
 function getOpenAIClient(): OpenAI {
     if (!_openai) {
@@ -13,8 +15,7 @@ function getOpenAIClient(): OpenAI {
 
         if (LLM_PROVIDER === 'openai' && !apiKey) {
             throw new Error(
-                'OPENAI_API_KEY environment variable is required when using OpenAI provider. ' +
-                'Please set it in your Netlify environment variables or use LM Studio instead.'
+                'OPENAI_API_KEY environment variable is required when using OpenAI provider.'
             );
         }
 
@@ -28,9 +29,27 @@ function getOpenAIClient(): OpenAI {
     return _openai;
 }
 
+function getGeminiClient(): GoogleGenerativeAI {
+    if (!_gemini) {
+        const apiKey = process.env.GEMINI_API_KEY;
+
+        if (!apiKey) {
+            throw new Error(
+                'GEMINI_API_KEY environment variable is required when using Gemini provider. ' +
+                'Get your API key from https://aistudio.google.com/app/apikey'
+            );
+        }
+
+        _gemini = new GoogleGenerativeAI(apiKey);
+    }
+    return _gemini;
+}
+
 const MODEL = LLM_PROVIDER === 'openai'
     ? (process.env.OPENAI_MODEL || 'gpt-4-turbo-preview')
-    : (process.env.LM_STUDIO_MODEL || 'local-model');
+    : LLM_PROVIDER === 'gemini'
+        ? (process.env.GEMINI_MODEL || 'gemini-1.5-flash')
+        : (process.env.LM_STUDIO_MODEL || 'local-model');
 
 export async function generateCompletion(
     prompt: string,
@@ -38,23 +57,39 @@ export async function generateCompletion(
     maxTokens: number = 2000
 ): Promise<string> {
     try {
-        const openai = getOpenAIClient();
-        const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
+        if (LLM_PROVIDER === 'gemini') {
+            // Use Gemini API
+            const genAI = getGeminiClient();
+            const model = genAI.getGenerativeModel({ model: MODEL });
 
-        if (systemPrompt) {
-            messages.push({ role: 'system', content: systemPrompt });
+            // Combine system prompt and user prompt for Gemini
+            const fullPrompt = systemPrompt
+                ? `${systemPrompt}\n\n${prompt}`
+                : prompt;
+
+            const result = await model.generateContent(fullPrompt);
+            const response = await result.response;
+            return response.text();
+        } else {
+            // Use OpenAI-compatible API (OpenAI or LM Studio)
+            const openai = getOpenAIClient();
+            const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
+
+            if (systemPrompt) {
+                messages.push({ role: 'system', content: systemPrompt });
+            }
+
+            messages.push({ role: 'user', content: prompt });
+
+            const response = await openai.chat.completions.create({
+                model: MODEL,
+                messages,
+                max_tokens: maxTokens,
+                temperature: 0.7,
+            });
+
+            return response.choices[0]?.message?.content || '';
         }
-
-        messages.push({ role: 'user', content: prompt });
-
-        const response = await openai.chat.completions.create({
-            model: MODEL,
-            messages,
-            max_tokens: maxTokens,
-            temperature: 0.7,
-        });
-
-        return response.choices[0]?.message?.content || '';
     } catch (error) {
         console.error('LLM Error:', error);
         throw new Error('Failed to generate completion');
@@ -66,39 +101,69 @@ export async function generateStreamCompletion(
     systemPrompt?: string
 ): Promise<ReadableStream> {
     try {
-        const openai = getOpenAIClient();
-        const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
+        if (LLM_PROVIDER === 'gemini') {
+            // Use Gemini API with streaming
+            const genAI = getGeminiClient();
+            const model = genAI.getGenerativeModel({ model: MODEL });
 
-        if (systemPrompt) {
-            messages.push({ role: 'system', content: systemPrompt });
-        }
+            const fullPrompt = systemPrompt
+                ? `${systemPrompt}\n\n${prompt}`
+                : prompt;
 
-        messages.push({ role: 'user', content: prompt });
+            const result = await model.generateContentStream(fullPrompt);
+            const encoder = new TextEncoder();
 
-        const stream = await openai.chat.completions.create({
-            model: MODEL,
-            messages,
-            stream: true,
-            temperature: 0.7,
-        });
-
-        const encoder = new TextEncoder();
-
-        return new ReadableStream({
-            async start(controller) {
-                try {
-                    for await (const chunk of stream) {
-                        const content = chunk.choices[0]?.delta?.content || '';
-                        if (content) {
-                            controller.enqueue(encoder.encode(content));
+            return new ReadableStream({
+                async start(controller) {
+                    try {
+                        for await (const chunk of result.stream) {
+                            const text = chunk.text();
+                            if (text) {
+                                controller.enqueue(encoder.encode(text));
+                            }
                         }
+                        controller.close();
+                    } catch (error) {
+                        controller.error(error);
                     }
-                    controller.close();
-                } catch (error) {
-                    controller.error(error);
-                }
-            },
-        });
+                },
+            });
+        } else {
+            // Use OpenAI-compatible API streaming
+            const openai = getOpenAIClient();
+            const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
+
+            if (systemPrompt) {
+                messages.push({ role: 'system', content: systemPrompt });
+            }
+
+            messages.push({ role: 'user', content: prompt });
+
+            const stream = await openai.chat.completions.create({
+                model: MODEL,
+                messages,
+                stream: true,
+                temperature: 0.7,
+            });
+
+            const encoder = new TextEncoder();
+
+            return new ReadableStream({
+                async start(controller) {
+                    try {
+                        for await (const chunk of stream) {
+                            const content = chunk.choices[0]?.delta?.content || '';
+                            if (content) {
+                                controller.enqueue(encoder.encode(content));
+                            }
+                        }
+                        controller.close();
+                    } catch (error) {
+                        controller.error(error);
+                    }
+                },
+            });
+        }
     } catch (error) {
         console.error('LLM Stream Error:', error);
         throw new Error('Failed to generate stream completion');
